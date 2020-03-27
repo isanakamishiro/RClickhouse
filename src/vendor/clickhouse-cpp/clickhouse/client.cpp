@@ -216,9 +216,9 @@ void Client::Impl::Insert(const std::string& table_name, const Block& block) {
 
     for (auto elem = fields.begin(); elem != fields.end(); ++elem) {
         if (std::distance(elem, fields.end()) == 1) {
-            fields_section << *elem;
+            fields_section << "`" << *elem << "`";
         } else {
-            fields_section << *elem << ",";
+            fields_section << "`" << *elem << "`,";
         }
     }
 
