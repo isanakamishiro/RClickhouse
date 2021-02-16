@@ -137,8 +137,74 @@ setMethod("dbSendQuery", c("ClickhouseConnection", "character"), function(conn, 
   ))
 })
 
+
+rch_dbCreateTable <- function (conn, name, fields, engine="TinyLog", overwrite = FALSE, ..., row.names = NULL, temporary = FALSE){
+  # removes table if exists and overWrite is true
+  qname <- dbQuoteIdentifier(conn, name)
+  if (overwrite && dbExistsTable(conn, qname)) dbRemoveTable(conn, qname)
+
+  # copied from DBI::dbCreateTable
+  stopifnot(is.null(row.names))
+  stopifnot(is.logical(temporary), length(temporary) == 1L)
+  query <- sqlCreateTable(con = conn, table = name, fields = fields,
+                          row.names = row.names, temporary = temporary, ...)
+
+  # specifies engine --> makes it compatible with Clickhouse
+  query <- paste(query, "ENGINE=", engine)
+
+  dbExecute(conn, query)
+  invisible(TRUE)
+}
+setMethod("dbCreateTable", "ClickhouseConnection", rch_dbCreateTable)
+
+
+rch_dbAppendTable <- function(conn, name, value, ..., row.names = NULL) {
+  if (is.vector(value) && !is.list(value)) value <- data.frame(x = value, stringsAsFactors = F)
+  if (length(value) < 1) stop("value must have at least one column")
+  if (is.null(names(value))) names(value) <- paste("V", 1:length(value), sep='')
+  if (length(value[[1]])>0) {
+    if (!is.data.frame(value)) value <- as.data.frame(value, row.names=1:length(value[[1]]) , stringsAsFactors=F)
+  } else {
+    if (!is.data.frame(value)) value <- as.data.frame(value, stringsAsFactors=F)
+  }
+  if ((!is.na(row.names) && !is.logical(row.names) && !is.character(row.names)) || length(row.names) != 1) {
+    stop("row.names must be NA, logical, or a string")
+  }
+
+  qname <- dbQuoteIdentifier(conn, name)
+  if (!dbExistsTable(conn, qname)) stop("Table ", qname, " doesn't exist. Use dbCreateTable first.")
+
+  rownames.col <- NA
+  if ((!is.na(row.names) && row.names == TRUE) || (is.na(row.names) && .row_names_info(value) >= 0)) {
+    rownames.col <- "row_names"
+  } else if (is.character(row.names)) {
+    rownames.col <- row.names
+  }
+  if (!is.na(rownames.col)) {
+    value[rownames.col] <- as.character(rownames(value))
+  }
+
+  if (length(value[[1]])) {
+    classes <- unlist(lapply(value, function(v){
+      class(v)[[1]]
+    }))
+    for (c in names(classes[classes=="character"])) {
+      value[[c]] <- .Internal(setEncoding(value[[c]], "UTF-8"))
+    }
+    for (c in names(classes[classes=="factor"])) {
+      levels(value[[c]]) <- .Internal(setEncoding(levels(value[[c]]), "UTF-8"))
+    }
+    names(value) <- sapply(names(value),escapeForInternalUse,forsql=FALSE)
+    insert(conn@ptr, qname, value);
+  }
+
+  return(invisible(TRUE))
+}
+setMethod("dbAppendTable", "ClickhouseConnection", rch_dbAppendTable)
+
+
 setMethod("dbWriteTable", signature(conn = "ClickhouseConnection", name = "character", value = "ANY"), definition = function(conn, name, value, overwrite=FALSE,
-                                                                                                                             append=FALSE, engine="TinyLog", row.names=NA, field.types=NULL, ...) {
+         append=FALSE, engine="TinyLog", row.names=NA, field.types=NULL, ...) {
   if (is.vector(value) && !is.list(value)) value <- data.frame(x = value, stringsAsFactors = F)
   if (length(value) < 1) stop("value must have at least one column")
   if (is.null(names(value))) names(value) <- paste("V", 1:length(value), sep='')
@@ -158,7 +224,6 @@ setMethod("dbWriteTable", signature(conn = "ClickhouseConnection", name = "chara
   }
 
   qname <- dbQuoteIdentifier(conn, name)
-
   if (dbExistsTable(conn, qname)) {
     if (overwrite) dbRemoveTable(conn, qname)
     if (!overwrite && !append) stop("Table ", qname, " already exists. Set overwrite=TRUE if you want
@@ -182,10 +247,28 @@ setMethod("dbWriteTable", signature(conn = "ClickhouseConnection", name = "chara
     } else if (!is.na(rownames.col)) {
       field.types <- append(field.types, "String")
     }
-    fdef <- paste(names(value), field.types, collapse=', ')
+    fdef <- paste(sapply(names(value),escapeForInternalUse, forsql=TRUE), field.types, collapse=', ')
     ct <- paste0("CREATE TABLE ", qname, " (", fdef, ") ENGINE=", engine)
     dbExecute(conn, ct)
+  } else if (is.null(field.types)) {
+    # do it for all in general but paticularly for the ones with all NAs...
+    # see how the datatypes are being interpreted by chcpp...
+    for (i in seq_along(value)) {
+      # print(column)
+      # print('')
+      if (all(is.na(value[i]))) {
+        emptyTable <- dbSendQuery(con, paste0("select * from ", qname, " where 1 != 1"))
+        column.data.types <- dbColumnInfo(emptyTable)$data.type
+        # print('changing it from')
+        # print(class(value[[i]]))
+        # print(value[i])
+        # print('to...')
+        # print(column.data.types[i])
+        class(value[[i]]) <- column.data.types[i]
+      }
+    }
   }
+
   if (length(value[[1]])) {
     classes <- unlist(lapply(value, function(v){
       class(v)[[1]]
@@ -196,7 +279,7 @@ setMethod("dbWriteTable", signature(conn = "ClickhouseConnection", name = "chara
     for (c in names(classes[classes=="factor"])) {
       levels(value[[c]]) <- .Internal(setEncoding(levels(value[[c]]), "UTF-8"))
     }
-
+    names(value) <- sapply(names(value),escapeForInternalUse,forsql=FALSE)
     insert(conn@ptr, qname, value);
   }
 
@@ -232,6 +315,22 @@ quoteString <- function(x) {
   x <- gsub('\\', '\\\\', x, fixed = TRUE)
   x <- gsub("'", "\\'", x, fixed = TRUE)
   return(SQL(ifelse(is.na(x), "NULL", paste0("'", x, "'"))))
+}
+
+# removes escape characters and then adds backticks for internal handling
+escapeForInternalUse <- function(identifier, forsql) {
+  if (grepl('^["](.*["])?$', identifier)) {
+    identifier <- gsub('^["](.*["])?$', substr(identifier, 2, nchar(identifier) -1), identifier)
+  } else if (grepl("^[`](.*[`])?$", identifier)) {
+    identifier <- gsub("^[`](.*[`])?$", substr(identifier, 2, nchar(identifier) -1), identifier)
+
+  }
+  if (forsql) {
+    return(paste0('`', identifier, '`'))
+  }
+  else{
+    return(identifier)
+  }
 }
 
 #' @export
@@ -274,3 +373,4 @@ setMethod("dbDisconnect", "ClickhouseConnection", function(conn, ...) {
   }
   invisible(TRUE)
 })
+
